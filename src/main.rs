@@ -1,39 +1,86 @@
 #[macro_use]
 extern crate rocket;
+#[macro_use]
+extern crate diesel;
 
-use cron::Schedule;
-use rocket::tokio::task;
-use rocket::tokio::time::{sleep, Duration};
-use std::str::FromStr;
-use std::sync::Arc;
-use std::time::SystemTime;
+mod db;
+mod models;
+mod schema;
 
-#[get("/")]
-fn index() -> &'static str {
-    "Welcome to Winem!"
+use db::{create_contract, delete_contract, get_contract, get_contracts, update_contract};
+use diesel::PgConnection;
+use dotenv::dotenv;
+use models::{Contract, NewContract};
+use rocket::response::status;
+use rocket::serde::{json::Json, Deserialize, Serialize};
+use rocket_sync_db_pools::database;
+
+#[database("postgres_db")]
+struct DbConn(PgConnection);
+
+#[derive(Deserialize)]
+struct ContractData {
+    name: String,
+    address: String,
+    status: i32,
 }
 
-async fn run_task() {
-    loop {
-        println!("Task executed at {:?}", SystemTime::now());
-        sleep(Duration::from_secs(60)).await;
-    }
+#[post("/", data = "<contract_data>")]
+async fn create(conn: DbConn, contract_data: Json<ContractData>) -> Json<Contract> {
+    conn.run(|c| {
+        create_contract(
+            c,
+            NewContract {
+                name: &contract_data.name,
+                address: &contract_data.address,
+                status: contract_data.status,
+            },
+        )
+    })
+    .await
+    .into()
+}
+
+#[get("/<id>")]
+async fn read(conn: DbConn, id: i32) -> Option<Json<Contract>> {
+    conn.run(move |c| get_contract(c, id)).await.map(Json)
+}
+
+#[get("/")]
+async fn read_all(conn: DbConn) -> Json<Vec<Contract>> {
+    conn.run(|c| get_contracts(c)).await.into()
+}
+
+#[put("/<id>", data = "<contract_data>")]
+async fn update(
+    conn: DbConn,
+    id: i32,
+    contract_data: Json<ContractData>,
+) -> Option<Json<Contract>> {
+    conn.run(move |c| {
+        update_contract(
+            c,
+            id,
+            &contract_data.name,
+            &contract_data.address,
+            contract_data.status,
+        )
+    })
+    .await
+    .map(Json)
+}
+
+#[delete("/<id>")]
+async fn delete(conn: DbConn, id: i32) -> status::NoContent {
+    conn.run(move |c| delete_contract(c, id)).await;
+    status::NoContent
 }
 
 #[launch]
 fn rocket() -> _ {
-    let schedule = Schedule::from_str("1/1 * * * * *").unwrap();
-    let shared_schedule = Arc::new(schedule);
-
-    task::spawn(async move {
-        let mut intervals = shared_schedule.upcoming(SystemTime::now());
-        while let Some(next) = intervals.next() {
-            let now = SystemTime::now();
-            let duration = next.duration_since(now).unwrap();
-            sleep(duration).await;
-            println!("Task executed at {:?}", next);
-        }
-    });
-
-    rocket::build().mount("/", routes![index])
+    dotenv().ok(); // Cargar variables de entorno desde .env
+    rocket::build().attach(DbConn::fairing()).mount(
+        "/contracts",
+        routes![create, read, read_all, update, delete],
+    )
 }
